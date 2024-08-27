@@ -85,19 +85,19 @@ def train(hyp, opt, device, tb_writer=None):
         with torch_distributed_zero_first(rank):
             attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
-        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        model = Model(opt.cfg or ckpt['model'].yaml, ch=opt.input_channels, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
         state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(state_dict, strict=False)  # load
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
-        model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        model = Model(opt.cfg, ch=opt.input_channels, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
     test_path = data_dict['val']
-
+    images_parent_folder = data_dict['path']
     # Freeze
     freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # parameter names to freeze (full or partial)
     for k, v in model.named_parameters():
@@ -177,8 +177,8 @@ def train(hyp, opt, device, tb_writer=None):
             if hasattr(v.rbr_dense, 'vector'):   
                 pg0.append(v.rbr_dense.vector)
 
-    if opt.adam:
-        optimizer = optim.Adam(pg0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
+    if opt.adam: # @@ HK AdamW() is a fix for Adam due to Wdecay/L2 loss bug
+        optimizer = optim.AdamW(pg0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
     else:
         optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
 
@@ -195,6 +195,9 @@ def train(hyp, opt, device, tb_writer=None):
         lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
     # plot_lr_scheduler(optimizer, scheduler, epochs)
+    from utils.plots import plot_lr_scheduler
+    plot_lr_scheduler(optimizer, scheduler, epochs, save_dir='/home/hanoch/projects/tir_od')
+
 
     # EMA
     ema = ModelEMA(model) if rank in [-1, 0] else None
@@ -245,17 +248,22 @@ def train(hyp, opt, device, tb_writer=None):
     dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
                                             hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
                                             world_size=opt.world_size, workers=opt.workers,
-                                            image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '))
+                                            image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '),
+                                            rel_path_images=images_parent_folder, num_cls=data_dict['nc'])
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
 
     # Process 0
     if rank in [-1, 0]:
-        testloader = create_dataloader(test_path, imgsz_test, batch_size * 2, gs, opt,  # testloader
-                                       hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
+        testloader , test_dataset = create_dataloader(test_path, imgsz_test, batch_size * 2, gs, opt,  # testloader
+                                       hyp=hyp, cache=opt.cache_images and not opt.notest, rect=False, rank=-1, # @@@ rect was True why?
                                        world_size=opt.world_size, workers=opt.workers,
-                                       pad=0.5, prefix=colorstr('val: '))[0]
+                                       pad=0.5, prefix=colorstr('val: '),
+                                       rel_path_images=images_parent_folder, num_cls=data_dict['nc'])
+
+        mlc = np.concatenate(test_dataset.labels, 0)[:, 0].max()  # max label class
+        assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (        mlc, nc, opt.data, nc - 1)
 
         if not opt.resume:
             labels = np.concatenate(dataset.labels, 0)
@@ -270,7 +278,7 @@ def train(hyp, opt, device, tb_writer=None):
             # Anchors
             if not opt.noautoanchor:
                 check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
-            model.half().float()  # pre-reduce anchor precision
+            model.half().float()  # pre-reduce anchor precision TODO HK Why ?
 
     # DDP mode
     if cuda and rank != -1:
@@ -335,7 +343,8 @@ def train(hyp, opt, device, tb_writer=None):
         optimizer.zero_grad()
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
-            imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
+            # imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0  @@HK TODO is that standartization ?
+            imgs = imgs.to(device, non_blocking=True).float()
 
             # Warmup
             if ni <= nw:
@@ -350,7 +359,7 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Multi-scale
             if opt.multi_scale:
-                sz = random.randrange(imgsz * 0.5, imgsz * 1.5 + gs) // gs * gs  # size
+                sz = random.randrange(int(imgsz * 0.5), int(imgsz * 1.5 + gs)) // gs * gs  # size
                 sf = sz / max(imgs.shape[2:])  # scale factor
                 if sf != 1:
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
@@ -390,7 +399,7 @@ def train(hyp, opt, device, tb_writer=None):
                 # Plot
                 if plots and ni < 10:
                     f = save_dir / f'train_batch{ni}.jpg'  # filename
-                    Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
+                    Thread(target=plot_images, args=(imgs, targets, paths, f, opt.input_channels), daemon=True).start()
                     # if tb_writer:
                     #     tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
                     #     tb_writer.add_graph(torch.jit.trace(model, imgs, strict=False), [])  # add model graph
@@ -403,8 +412,10 @@ def train(hyp, opt, device, tb_writer=None):
 
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for tensorboard
+        print("Lr : ", 10*'+',lr)
         scheduler.step()
-
+        if 1:  #@@ HK
+            plots = True
         # DDP process 0 or single-GPU
         if rank in [-1, 0]:
             # mAP
@@ -415,6 +426,7 @@ def train(hyp, opt, device, tb_writer=None):
                 results, maps, times = test.test(data_dict,
                                                  batch_size=batch_size * 2,
                                                  imgsz=imgsz_test,
+                                                 save_json=True,
                                                  model=ema.ema,
                                                  single_cls=opt.single_cls,
                                                  dataloader=testloader,
@@ -562,6 +574,12 @@ if __name__ == '__main__':
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone of yolov7=50, first3=0 1 2')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--tir-od', action='store_true', help='TIR Object Detection')
+    parser.add_argument('--norm-type', type=str, default='standardization',
+                        choices=['standardization', 'single_image_0_to_1', 'single_image_mean_std', 'single_image_percentile_0_1', 'remove+global_outlier_0_1'],
+                        help='Normalization approach')
+    parser.add_argument('--input-channels', type=int, default=3, help='')
+
     opt = parser.parse_args()
 
     # Set DDP variables
@@ -703,3 +721,18 @@ if __name__ == '__main__':
         plot_evolution(yaml_file)
         print(f'Hyperparameter evolution complete. Best results saved as: {yaml_file}\n'
               f'Command to train a new model with these hyperparameters: $ python train.py --hyp {yaml_file}')
+
+
+"""
+TODO
+Anchors,
+    hyp['anchor_t'] = 4 let the AR<=4 => TODO check if valid 
+    Ive reduced anchors to 2 per anchors: 2
+Sampler : torch_weighted : WeightedRandomSampler
+PP-YOLO bumps the batch size up from 64 to 192. Of course, this is hard to implement if you have GPU memory constraints.
+
+python train.py --workers 8 --device 'cpu' --batch-size 32 --data data/coco.yaml --img 640 640 --cfg cfg/training/yolov7.yaml --weights 'v7' --name yolov7 --hyp data/hyp.scratch.p5.yaml
+--workers 8 --device cpu --batch-size 32 --data data/tir_od.yaml --img 640 640 --cfg cfg/training/yolov7.yaml --weights 'v7' --name yolov7 --cache-images --hyp data/hyp.tir_od.tiny.yaml --adam --norm-type single_image_percentile_0_1
+--workers 8 --device cpu --batch-size 32 --data data/tir_od.yaml --img 640 640 --cfg cfg/training/yolov7-tiny.yaml --weights 'v7' --name yolov7 --cache-images --hyp data/hyp.tir_od.tiny.yaml --adam --norm-type single_image_percentile_0_1 --input-channels 1 --multi-scale
+--multi-scale training with resized image resolution not good for TIR
+"""
